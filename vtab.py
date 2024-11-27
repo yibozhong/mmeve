@@ -91,12 +91,10 @@ class ImageFilelistForQwen(data.Dataset):
         impath, target = self.imlist[index]
         img = self.loader(os.path.join(self.root, impath))
         if self.transform is not None:
-            img, thw = self.transform(img)
-        # change thw from list to tensor
-        # print(type(thw))
+            img = self.transform(img)
         if self.target_transform is not None:
             target = self.target_transform(target)
-        return img, target, thw
+        return img, target
 
     def __len__(self):
         return len(self.imlist)
@@ -108,7 +106,7 @@ def get_data(name, normalize=True, batch_size=128, evaluate=True):
         transform = transforms.Compose([
             transforms.Resize((224, 224), interpolation=3),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+            transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])])
     else:
         transform = transforms.Compose([
             transforms.Resize((224, 224), interpolation=3),
@@ -139,7 +137,26 @@ def get_data(name, normalize=True, batch_size=128, evaluate=True):
             num_workers=4, pin_memory=True)
     return train_loader, val_loader
 
-def get_data_for_qwen(name, normalize=True, batch_size=64, evaluate=True):
+def get_data_for_qwen(name, normalize=True, batch_size=128, evaluate=True):
+    root = './data/vtab-1k/' + name
+    transform = transforms.Compose([
+         transforms.Resize((224, 224), interpolation=3),
+        transforms.ToTensor()])
+    if evaluate:
+        train_loader = torch.utils.data.DataLoader(
+            ImageFilelist(root=root, flist=root + "/train800val200.txt",
+                          transform=transform),
+            batch_size=batch_size, shuffle=True, drop_last=True,
+            num_workers=4, pin_memory=True)
+
+        val_loader = torch.utils.data.DataLoader(
+            ImageFilelist(root=root, flist=root + "/test.txt",
+                          transform=transform),
+            batch_size=256, shuffle=False,
+            num_workers=4, pin_memory=True)
+    return train_loader, val_loader
+
+def get_data_for_qwen2(name, normalize=True, batch_size=64, evaluate=True):
     root = './data/vtab-1k/' + name
     processor = Qwen2VLImageProcessor(do_resize=True)
     class ProcessorTransform:
@@ -148,6 +165,7 @@ def get_data_for_qwen(name, normalize=True, batch_size=64, evaluate=True):
         
         def __call__(self, image):
             # processor处理图像，返回pixel_values
+            # print(image.size)
             inputs = self.processor(images=image, return_tensors="pt")
             return inputs['pixel_values'], inputs['image_grid_thw']
     

@@ -12,7 +12,8 @@ from argparse import ArgumentParser
 from vtab import *
 from utils import set_seed, AverageMeter
 import os
-from transformers import CLIPProcessor, CLIPModel, Qwen2VLForConditionalGeneration, AutoProcessor
+# from torch import bmm
+from transformers import CLIPProcessor, CLIPModel, Qwen2VLForConditionalGeneration, AutoProcessor, AutoModelForCausalLM
 from transformers import Qwen2VLImageProcessor
 from torch.optim.lr_scheduler import LinearLR
 from qwen_vl_utils import process_vision_info
@@ -36,7 +37,16 @@ def get_clip_vision_model(model_name):
     model = CLIPModel.from_pretrained(model_name).vision_model
     return model
 
+def get_openclip_vit_big_G():
+    # this is the vision encoder used by Qwen-VL
+    model, preprocess = create_model_from_pretrained('hf-hub:laion/CLIP-ViT-bigG-14-laion2B-39B-b160k')
+    # write config to a file
+    # with open('openclip_vit_bigG_config.log', 'a') as f:
+    #     f.write(str(model.config))
+    return model.visual
+
 def get_dfn_vision_model():
+    # this is the vision encoder used by Qwen2-VL, but with notable modifications
     print(f"getting dfn vision model")
     model, preprocess = create_model_from_pretrained('hf-hub:apple/DFN5B-CLIP-ViT-H-14')
     return model.visual
@@ -46,18 +56,34 @@ def get_qwen2vl_vision_encoder():
     model = Qwen2VLForConditionalGeneration.from_pretrained(
     "Qwen/Qwen2-VL-7B-Instruct", torch_dtype="auto", device_map="auto"
     )
-    with open('qwenconfig', 'a') as f:
-        f.write(str(model.visual.config))
+    # with open('qwenconfig', 'a') as f:
+    #     f.write(str(model.visual.config))
     import copy
     backbone = copy.deepcopy(model.visual)
     
-    # 3. 显式释放原模型
+    # 
     del model
-    torch.cuda.empty_cache()  # 清理GPU缓存
+    torch.cuda.empty_cache()  # release memory
     print(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
     print(f"GPU memory cached: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
     
     return backbone
+
+def get_qwenvl_vision_encoder():
+    model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen-VL", device_map="cuda", trust_remote_code=True).eval()
+    # print(model)
+    # write the model structure to a file
+    # with open('qwen_vl_model.log', 'a') as f:
+    #      f.write(str(model))
+    # write config to a file
+    with open('qwen_vl_config.log', 'a') as f:
+        f.write(str(model.config))
+    
+    # inspect the forward function
+    # import inspect
+    # with open('qwen_vl_forward.log', 'a') as f:
+    #     f.write(inspect.getsource(model.transformer.visual.__init__))
+    return model.transformer.visual
 
 
 def train(args, model, dl, opt, scheduler, epoch):
@@ -69,8 +95,8 @@ def train(args, model, dl, opt, scheduler, epoch):
         model = model.cuda()
         for i, batch in enumerate(dl):
             x, y = batch[0].cuda(), batch[1].cuda()
+            # print(x.shape, y.shape)
             opt.zero_grad()
-            # 更新 autocast 的用法
             with autocast():
                 out = model(x)
                 loss = F.cross_entropy(out, y)
@@ -88,7 +114,7 @@ def train(args, model, dl, opt, scheduler, epoch):
     model = model.cpu()
     return model
 
-def train_qwen(args, model, dl, opt, scheduler, epoch):
+def train_qwen2(args, model, dl, opt, scheduler, epoch):
     model.train()
     model = model.cuda()
     # 更新 GradScaler 的初始化
@@ -147,6 +173,35 @@ class ViTLargeInitFromOpenAICliP(nn.Module):
     def count_trainable_params(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
+class ViTBigGInitFromOpenCliP(nn.Module):
+    def __init__(self, backbone, class_number):
+        super().__init__()
+        self.backbone = backbone
+        self.class_number = class_number
+        self.classifier = nn.Linear(1280, class_number)
+    def forward(self, x):
+        x = self.backbone(x)
+        x = self.classifier(x)
+        return x
+
+    def count_trainable_params(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+class ViTBigGInitFromQwenVL(nn.Module):
+    def __init__(self, backbone, class_number):
+        super().__init__()
+        self.backbone = backbone
+        self.class_number = class_number
+        self.classifier = nn.Linear(4096, class_number)
+    def forward(self, x):
+        x = self.backbone(x)
+        x = torch.mean(x, dim=1)
+        x = self.classifier(x)
+        return x
+    
+    def count_trainable_params(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
 class ViTInitFromQwenVL(nn.Module):
     def __init__(self, backbone, class_number):
         super().__init__()
@@ -178,6 +233,7 @@ if __name__ == '__main__':
     parser.add_argument('--model', type=str, default='openai/clip-vit-large-patch14')
     parser.add_argument('--dataset', type=str, default='caltech101')
     parser.add_argument('--mm_trained', action='store_true', default=False)
+    parser.add_argument('--qwen2', action='store_true', default=False)
     parser.add_argument('--qwen', action='store_true', default=False)
     args = parser.parse_args()
     print(args)
@@ -186,18 +242,25 @@ if __name__ == '__main__':
 
     # define the model and dataloader
     if not args.mm_trained:
-        backbone = get_dfn_vision_model()
+        # backbone = get_dfn_vision_model()
+        backbone = get_openclip_vit_big_G()
     else:
-        backbone = get_qwen2vl_vision_encoder()
-    # backbone.config._attn_implementation = 'flash_attention_2'
-    # print(backbone.config._attn_implementation)
-    if not args.qwen:
-        vit = ViTLargeInitFromOpenAICliP(backbone, get_classes_num(args.dataset))
-        train_dl, test_dl = get_data(args.dataset, normalize=False)
+        # backbone = get_qwen2vl_vision_encoder()
+        backbone = get_qwenvl_vision_encoder()
+    if not args.qwen2 and not args.qwen:
+        print(f"using original clip models. ")
+        # vit = ViTLargeInitFromOpenAICliP(backbone, get_classes_num(args.dataset))
+        vit = ViTBigGInitFromOpenCliP(backbone, get_classes_num(args.dataset))
+        train_dl, test_dl = get_data(args.dataset, normalize=True)
+    elif args.qwen:
+        print(f"using vision encoder from qwen vl.")
+        vit = ViTBigGInitFromQwenVL(backbone, get_classes_num(args.dataset))
+        train_dl, test_dl = get_data_for_qwen(args.dataset)
     else:
+        print(f"using vision encoder from qwen2 vl.")
         processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
         vit = ViTInitFromQwenVL(backbone, get_classes_num(args.dataset))
-        train_dl, test_dl = get_data_for_qwen(args.dataset, normalize=False)
+        train_dl, test_dl = get_data_for_qwen2(args.dataset, normalize=False)
     
     # train_dl, test_dl = get_data(args.dataset, normalize=False)
     print(sum(p.numel() for p in vit.parameters()))
@@ -215,10 +278,10 @@ if __name__ == '__main__':
     # scheduler = CosineLRScheduler(opt, t_initial=100,
     #                                 warmup_t=10, lr_min=1e-5, warmup_lr_init=5e-6)
     scheduler = LinearLR(opt, start_factor=1.0, end_factor=0.1, total_iters=100)
-    if not args.qwen:
+    if not args.qwen2:
         vit = train(args, vit, train_dl, opt, scheduler, epoch=100)
     else:
-        vit = train_qwen(args, vit, train_dl, opt, scheduler, epoch=100)
+        vit = train_qwen2(args, vit, train_dl, opt, scheduler, epoch=100)
 
     print('best_acc:', args.best_acc)
     with open('results_lp.log', 'a') as f:
